@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>通用型表格解析引擎 — World Corner</title>
+<style>
+  :root {
+    --primary: #3B82F6;
+    --primary-hover: #2563EB;
+    --bg: #F8FAFC;
+    --surface: #FFFFFF;
+    --border: #E2E8F0;
+    --text: #1E293B;
+    --text-secondary: #64748B;
+    --success: #10B981;
+    --error: #EF4444;
+    --radius: 12px;
+    --shadow: 0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.06);
+    --shadow-lg: 0 10px 15px -3px rgba(0,0,0,.1), 0 4px 6px -4px rgba(0,0,0,.1);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+  }
+
+  .container { width: 100%; max-width: 680px; }
+
+  /* Header */
+  .header {
+    text-align: center;
+    margin-bottom: 2rem;
+  }
+  .header h1 {
+    font-size: 1.75rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, var(--primary), #8B5CF6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .header p { color: var(--text-secondary); margin-top: .25rem; font-size: .9rem; }
+
+  /* Upload Zone */
+  .upload-zone {
+    background: var(--surface);
+    border: 2px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 3rem 2rem;
+    text-align: center;
+    cursor: pointer;
+    transition: all .2s;
+    position: relative;
+  }
+  .upload-zone.drag-over {
+    border-color: var(--primary);
+    background: #EFF6FF;
+  }
+  .upload-zone.has-file {
+    border-style: solid;
+    border-color: var(--success);
+    background: #F0FDF4;
+  }
+  .upload-icon {
+    font-size: 3rem;
+    margin-bottom: .75rem;
+    display: block;
+  }
+  .upload-zone h3 { font-size: 1.1rem; margin-bottom: .25rem; }
+  .upload-zone .hint { font-size: .85rem; color: var(--text-secondary); }
+  .upload-zone input[type=file] { display: none; }
+
+  /* Preview */
+  .preview {
+    margin-top: 1rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    display: none;
+    align-items: center;
+    gap: .75rem;
+  }
+  .preview.visible { display: flex; }
+  .preview img {
+    width: 64px;
+    height: 64px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+  }
+  .preview .info { flex: 1; min-width: 0; }
+  .preview .name { font-weight: 600; font-size: .9rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .preview .size { font-size: .8rem; color: var(--text-secondary); }
+  .preview .remove-btn {
+    background: none; border: none;
+    color: var(--error); cursor: pointer;
+    font-size: 1.25rem; padding: .25rem;
+  }
+
+  /* Controls */
+  .controls {
+    margin-top: 1rem;
+    display: flex;
+    gap: .75rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+    font-size: .85rem;
+    color: var(--text-secondary);
+  }
+  .toggle {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    background: var(--border);
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background .2s;
+    flex-shrink: 0;
+  }
+  .toggle.on { background: var(--primary); }
+  .toggle::after {
+    content: '';
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 20px; height: 20px;
+    background: white;
+    border-radius: 50%;
+    transition: transform .2s;
+    box-shadow: 0 1px 3px rgba(0,0,0,.15);
+  }
+  .toggle.on::after { transform: translateX(20px); }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: .4rem;
+    padding: .65rem 1.5rem;
+    border: none;
+    border-radius: 8px;
+    font-size: .95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all .15s;
+  }
+  .btn-primary {
+    background: var(--primary);
+    color: white;
+    flex: 1;
+  }
+  .btn-primary:hover:not(:disabled) { background: var(--primary-hover); }
+  .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-outline {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-outline:hover { background: var(--bg); }
+
+  /* Status */
+  .status {
+    margin-top: 1rem;
+    padding: .75rem 1rem;
+    border-radius: 8px;
+    font-size: .85rem;
+    display: none;
+  }
+  .status.visible { display: block; }
+  .status.loading { background: #FEF3C7; color: #92400E; display: block; }
+  .status.success { background: #D1FAE5; color: #065F46; display: block; }
+  .status.error { background: #FEE2E2; color: #991B1B; display: block; }
+
+  .spinner {
+    display: inline-block;
+    width: 16px; height: 16px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: spin .6s linear infinite;
+    vertical-align: middle;
+    margin-right: .35rem;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Features */
+  .features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: .75rem;
+    margin-top: 1.5rem;
+  }
+  .feature-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1rem;
+    text-align: center;
+    font-size: .85rem;
+  }
+  .feature-card .icon { font-size: 1.5rem; display: block; margin-bottom: .35rem; }
+</style>
+</head>
+<body>
+<div class="container">
+  <!-- Header -->
+  <div class="header">
+    <h1>📊 通用型表格解析引擎</h1>
+    <p>上传表格图片 → AI 智能识别 → 完美 Excel 下载</p>
+  </div>
+
+  <!-- Upload Zone -->
+  <div class="upload-zone" id="uploadZone">
+    <span class="upload-icon">🖼️</span>
+    <h3>拖拽图片到此处，或点击选择</h3>
+    <p class="hint">支持 PNG / JPEG / WEBP / TIFF，最大 20 MB · 也支持 Ctrl+V 粘贴</p>
+    <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp,image/tiff">
+  </div>
+
+  <!-- File Preview -->
+  <div class="preview" id="preview">
+    <img id="previewImg" src="" alt="Preview">
+    <div class="info">
+      <div class="name" id="previewName"></div>
+      <div class="size" id="previewSize"></div>
+    </div>
+    <button class="remove-btn" id="removeBtn" title="移除">&times;</button>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="toggle-row">
+      <span>🧪 模拟模式</span>
+      <div class="toggle on" id="mockToggle"></div>
+    </div>
+    <button class="btn btn-primary" id="submitBtn" disabled>
+      🚀 开始解析
+    </button>
+  </div>
+
+  <!-- Status -->
+  <div class="status" id="status"></div>
+
+  <!-- Feature cards -->
+  <div class="features">
+    <div class="feature-card"><span class="icon">🧠</span>AI 多模态识别</div>
+    <div class="feature-card"><span class="icon">📐</span>合并单元格还原</div>
+    <div class="feature-card"><span class="icon">🎨</span>自动样式排版</div>
+    <div class="feature-card"><span class="icon">⚡</span>流式即时下载</div>
+    <div class="feature-card"><span class="icon">📋</span>支持任意表格</div>
+    <div class="feature-card"><span class="icon">🔒</span>安全文件校验</div>
+  </div>
+</div>
+
+<script>
+  const uploadZone = document.getElementById('uploadZone');
+  const fileInput = document.getElementById('fileInput');
+  const preview = document.getElementById('preview');
+  const previewImg = document.getElementById('previewImg');
+  const previewName = document.getElementById('previewName');
+  const previewSize = document.getElementById('previewSize');
+  const removeBtn = document.getElementById('removeBtn');
+  const mockToggle = document.getElementById('mockToggle');
+  const submitBtn = document.getElementById('submitBtn');
+  const statusEl = document.getElementById('status');
+
+  let selectedFile = null;
+
+  // --- File selection ---
+  uploadZone.addEventListener('click', () => fileInput.click());
+
+  uploadZone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    uploadZone.classList.add('drag-over');
+  });
+  uploadZone.addEventListener('dragleave', () => {
+    uploadZone.classList.remove('drag-over');
+  });
+  uploadZone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    uploadZone.classList.remove('drag-over');
+    const files = e.dataTransfer.files;
+    if (files.length > 0) setFile(files[0]);
+  });
+
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length > 0) setFile(fileInput.files[0]);
+  });
+
+  // Clipboard paste
+  document.addEventListener('paste', (e) => {
+    const items = e.clipboardData.items;
+    for (const item of items) {
+      if (item.type.startsWith('image/')) {
+        const blob = item.getAsFile();
+        setFile(blob);
+        break;
+      }
+    }
+  });
+
+  removeBtn.addEventListener('click', () => {
+    selectedFile = null;
+    fileInput.value = '';
+    updateUI();
+  });
+
+  // Mock toggle
+  mockToggle.addEventListener('click', () => {
+    mockToggle.classList.toggle('on');
+  });
+
+  // Submit
+  submitBtn.addEventListener('click', uploadAndDownload);
+
+  function setFile(file) {
+    selectedFile = file;
+    updateUI();
+
+    // Generate preview
+    if (file.type.startsWith('image/')) {
+      const reader = new FileReader();
+      reader.onload = (e) => { previewImg.src = e.target.result; };
+      reader.readAsDataURL(file);
+    }
+  }
+
+  function formatBytes(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function updateUI() {
+    if (selectedFile) {
+      previewName.textContent = selectedFile.name || 'clipboard-image.png';
+      previewSize.textContent = formatBytes(selectedFile.size);
+      preview.classList.add('visible');
+      uploadZone.classList.add('has-file');
+      submitBtn.disabled = false;
+    } else {
+      preview.classList.remove('visible');
+      uploadZone.classList.remove('has-file');
+      previewImg.src = '';
+      submitBtn.disabled = true;
+    }
+    statusEl.className = 'status';
+    statusEl.innerHTML = '';
+  }
+
+  async function uploadAndDownload() {
+    if (!selectedFile) return;
+
+    const useMock = mockToggle.classList.contains('on');
+    const formData = new FormData();
+    formData.append('file', selectedFile);
+
+    // Show loading
+    statusEl.className = 'status loading';
+    statusEl.innerHTML = '<span class="spinner"></span>正在调用 AI 解析表格结构，请稍候...';
+    submitBtn.disabled = true;
+
+    try {
+      const resp = await fetch(`/api/upload?use_mock=${useMock}`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+        throw new Error(err.detail || err.error || `HTTP ${resp.status}`);
+      }
+
+      // Extract filename from Content-Disposition
+      const disposition = resp.headers.get('Content-Disposition') || '';
+      const match = disposition.match(/filename\*?=(?:UTF-8'')?(.+)/i);
+      const filename = match ? decodeURIComponent(match[1]) : 'table_export.xlsx';
+
+      // Trigger download
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      statusEl.className = 'status success';
+      statusEl.innerHTML = '✅ 解析完成！Excel 文件已自动下载。';
+    } catch (err) {
+      statusEl.className = 'status error';
+      statusEl.innerHTML = `❌ 解析失败：${err.message}`;
+    } finally {
+      submitBtn.disabled = false;
+      if (statusEl.classList.contains('loading')) {
+        statusEl.className = 'status';
+      }
+    }
+  }
+</script>
+</body>
+</html>
