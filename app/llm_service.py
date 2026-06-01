@@ -50,6 +50,25 @@ VISION_PROMPT = """仔细观察这张表格图片，用紧凑格式输出所有�
 4. 保留 □ ☑ 等特殊符号，精确还原数字和单位
 5. 逐格输出，不要跳格，不要遗漏任何区域"""
 
+# Qwen VL: output HTML table — standard format, well-supported by LLMs
+VISION_PROMPT_HTML = """仔细观察这张表格图片，输出这个表格的 HTML 代码。
+
+只输出 <table> 标签及其内容，不要输出任何其他文字。
+
+格式要求：
+<table>
+  <tr><td rowspan="1" colspan="1">单位工程名称</td><td rowspan="1" colspan="3">某高标准农田项目</td></tr>
+  <tr><td rowspan="1" colspan="2">检查项目</td><td rowspan="1" colspan="1">质量标准</td><td rowspan="1" colspan="1">检查记录</td></tr>
+</table>
+
+规则：
+1. 每个 <td> 必须标注 rowspan 和 colspan，默认为 1
+2. 被合并单元格占用的位置不要输出额外的空 <td>
+3. 竖排文字转为横排输出
+4. 保留 □ ☑ ○ ● ✓ ✗ 等特殊符号，精确还原数字和单位
+5. 表格标题用 <caption> 标签
+6. 底部备注、签名栏也要包含在表格中"""
+
 # DeepSeek: compact format → JSON
 STRUCTURING_PROMPT = """将紧凑格式的表格数据转换为标准JSON。
 
@@ -312,6 +331,94 @@ def _parse(raw: dict[str, Any]) -> TableData:
     return TableData(title=raw.get("title", ""), rows=rows)
 
 
+def _parse_html_table(text: str) -> dict[str, Any] | None:
+    """Parse HTML <table> output from Qwen VL into the same dict format as _parse_compact.
+
+    Uses Python's built-in HTMLParser (no extra dependencies).
+    Handles <td rowspan=N colspan=N>, <caption>, and nested <tr> elements.
+    """
+    from html.parser import HTMLParser
+
+    class TableParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.title = ""
+            self.rows: list[list[dict[str, Any]]] = []
+            self._current_row: list[dict[str, Any]] = []
+            self._in_caption = False
+            self._in_td = False
+            self._td_text = ""
+            self._td_rowspan = 1
+            self._td_colspan = 1
+
+        def handle_starttag(self, tag, attrs):
+            attrs_dict = dict(attrs)
+            if tag == "caption":
+                self._in_caption = True
+            elif tag in ("td", "th"):
+                self._in_td = True
+                self._td_text = ""
+                self._td_rowspan = int(attrs_dict.get("rowspan", 1))
+                self._td_colspan = int(attrs_dict.get("colspan", 1))
+            elif tag == "tr":
+                self._current_row = []
+
+        def handle_endtag(self, tag):
+            if tag == "caption":
+                self._in_caption = False
+            elif tag in ("td", "th"):
+                self._in_td = False
+                self._current_row.append({
+                    "text": self._td_text.strip(),
+                    "rowspan": self._td_rowspan,
+                    "colspan": self._td_colspan,
+                })
+            elif tag == "tr":
+                if self._current_row:
+                    self.rows.append(self._current_row)
+                self._current_row = []
+
+        def handle_data(self, data):
+            if self._in_caption:
+                self.title += data
+            elif self._in_td:
+                self._td_text += data
+
+    parser = TableParser()
+    try:
+        parser.feed(text)
+    except Exception:
+        return None
+
+    if not parser.rows:
+        return None
+
+    # Convert list-of-rows to dict-based format (same as _parse_compact output)
+    cells: dict[tuple[int, int], dict[str, Any]] = {}
+    occupied: set[tuple[int, int]] = set()
+    for r, row in enumerate(parser.rows):
+        c = 0
+        for cell in row:
+            while (r, c) in occupied:
+                c += 1
+            cells[(r, c)] = {
+                "text": cell["text"],
+                "rowspan": cell["rowspan"],
+                "colspan": cell["colspan"],
+            }
+            for ri in range(r, r + cell["rowspan"]):
+                for ci in range(c, c + cell["colspan"]):
+                    if ri != r or ci != c:
+                        occupied.add((ri, ci))
+            c += cell["colspan"]
+
+    return {"title": parser.title.strip(), "rows": [
+        [cells.get((r, c), {"text": "", "rowspan": 1, "colspan": 1})
+         for c in range(max(cells.keys(), key=lambda k: k[1])[1] + 1)]
+        for r in range(max(cells.keys(), key=lambda k: k[0])[0] + 1)
+    ]}
+
+
 def _parse_compact(text: str) -> dict[str, Any] | None:
     """Parse Qwen's compact format directly in Python.
 
@@ -424,20 +531,115 @@ def _merge_ocr_text(table: dict[str, Any], ocr_items: list[dict], img_h: int = 0
     return table
 
 
+def _detect_columns_from_ocr(items: list[dict]) -> list[tuple[float, float]]:
+    """Detect column boundaries from OCR item x-positions using gap analysis.
+
+    Returns list of (x_min, x_max) column ranges sorted left-to-right.
+    """
+    if len(items) < 2:
+        return [(0, float("inf"))]
+
+    # Sort by x_center
+    sorted_items = sorted(items, key=lambda it: it["x"] + it.get("w", 0) / 2)
+
+    # Compute gaps between consecutive items' x_centers
+    x_centers = [it["x"] + it.get("w", 0) / 2 for it in sorted_items]
+    gaps = [x_centers[i + 1] - x_centers[i] for i in range(len(x_centers) - 1)]
+
+    if not gaps:
+        return [(0, float("inf"))]
+
+    # Median gap as the "normal" within-column gap
+    sorted_gaps = sorted(gaps)
+    median_gap = sorted_gaps[len(sorted_gaps) // 2]
+
+    # Column boundaries: gaps significantly larger than median (>= 3x)
+    boundary_threshold = max(median_gap * 3, 30)  # minimum 30px
+
+    columns: list[tuple[float, float]] = []
+    col_start = sorted_items[0]["x"]  # left edge of first column
+    for i, gap in enumerate(gaps):
+        if gap >= boundary_threshold:
+            col_end = sorted_items[i]["x"] + sorted_items[i].get("w", 0)
+            columns.append((col_start, col_end))
+            col_start = sorted_items[i + 1]["x"]
+
+    # Last column
+    last = sorted_items[-1]
+    columns.append((col_start, last["x"] + last.get("w", 0)))
+
+    return columns
+
+
 def _build_from_ocr(items: list[dict], img_h: int = 0) -> dict[str, Any] | None:
-    """Build simple table from OCR items — last resort."""
+    """Build table from OCR items with row AND column detection.
+
+    Uses _row_threshold for row grouping and _detect_columns_from_ocr
+    for column boundary detection. Handles borderless tables.
+    """
     if not items:
         return None
-    rows, cur, thresh = [], [], _row_threshold(img_h)
-    for it in items:
-        if not cur or abs(it["y"] - cur[0]["y"]) < thresh:
+
+    row_thresh = _row_threshold(img_h)
+
+    # 1. Group items into rows by y-coordinate
+    sorted_items = sorted(items, key=lambda it: (it["y"], it["x"]))
+    raw_rows: list[list[dict]] = []
+    cur: list[dict] = []
+    for it in sorted_items:
+        if not cur or abs(it["y"] - cur[0]["y"]) < row_thresh:
             cur.append(it)
         else:
-            rows.append([{"text": c["text"], "rowspan": 1, "colspan": 1} for c in cur])
+            cur.sort(key=lambda it: it["x"])
+            raw_rows.append(cur)
             cur = [it]
     if cur:
-        rows.append([{"text": c["text"], "rowspan": 1, "colspan": 1} for c in cur])
-    return {"title": "", "rows": rows} if rows else None
+        cur.sort(key=lambda it: it["x"])
+        raw_rows.append(cur)
+
+    # 2. Detect columns from all items (global column structure)
+    columns = _detect_columns_from_ocr(items)
+    if len(columns) <= 1:
+        # Single column — fall back to simple row grouping
+        rows = [[{"text": c["text"], "rowspan": 1, "colspan": 1} for c in row]
+                for row in raw_rows]
+        return {"title": "", "rows": rows} if rows else None
+
+    # 3. Assign each item to a (row, col) cell
+    grid: dict[tuple[int, int], str] = {}
+    for r_idx, row_items in enumerate(raw_rows):
+        for it in row_items:
+            x_center = it["x"] + it.get("w", 0) / 2
+            # Find which column this item belongs to
+            col_idx = -1
+            for c_idx, (cx_min, cx_max) in enumerate(columns):
+                if cx_min <= x_center <= cx_max:
+                    col_idx = c_idx
+                    break
+            if col_idx >= 0:
+                # If cell already has text, append
+                existing = grid.get((r_idx, col_idx), "")
+                sep = " " if existing else ""
+                grid[(r_idx, col_idx)] = existing + sep + it["text"]
+
+    if not grid:
+        return None
+
+    max_row = max(r for r, _ in grid.keys())
+    max_col = max(c for _, c in grid.keys())
+
+    # 4. Build 2D grid
+    rows: list[list[dict[str, Any]]] = []
+    for r in range(max_row + 1):
+        row: list[dict[str, Any]] = []
+        for c in range(max_col + 1):
+            text = grid.get((r, c), "")
+            row.append({"text": text, "rowspan": 1, "colspan": 1})
+        rows.append(row)
+
+    logger.info("OCR table: %d rows x %d cols (columns detected: %d)",
+                len(rows), max_col + 1, len(columns))
+    return {"title": "", "rows": rows}
 
 
 def _save_debug(text: str, tag: str = "qwen") -> None:
@@ -566,26 +768,48 @@ class LLMService:
     async def _pipeline(
         self, img: bytes, fmt: str, ocr_items: list[dict],
     ) -> dict[str, Any]:
-        """1. Qwen VL → compact text  2. DeepSeek → JSON"""
+        """1. Qwen VL → structured text  2. DeepSeek → JSON  3. OCR fallback"""
         b64 = _b64(img)
+        s = get_settings()
+        output_format = s.table_output_format
 
-        # Step 1: Qwen VL outputs compact format
-        logger.info("Step 1: Qwen VL → compact format")
-        raw = await self._call_vision(b64, fmt)
-        self._last_raw = raw
-        _save_debug(raw, "qwen_compact")
+        # Step 1: Qwen VL — choose prompt + parser based on output_format
+        if output_format == "html":
+            logger.info("Step 1: Qwen VL → HTML table")
+            raw = await self._call_vision(b64, fmt, prompt=VISION_PROMPT_HTML)
+            self._last_raw = raw
+            _save_debug(raw, "qwen_html")
 
-        # Try Python parser first (fast, no API call)
-        result = _parse_compact(raw)
-        if result is not None:
-            logger.info("Step 1 OK (Python): %d rows", len(result.get("rows", [])))
-            result = _merge_ocr_text(result, ocr_items, self._img_h)
-            return result
+            result = _parse_html_table(raw)
+            if result is not None:
+                logger.info("Step 1 OK (HTML): %d rows", len(result.get("rows", [])))
+                result = _merge_ocr_text(result, ocr_items, self._img_h)
+                return result
 
-        # Step 2: DeepSeek structures compact → JSON
+            # HTML failed — try parsing as compact format (same raw text, no extra API call)
+            logger.info("HTML parse failed, trying compact parser on same output")
+            result = _parse_compact(raw)
+            if result is not None:
+                logger.info("Step 1 OK (compact fallback): %d rows", len(result.get("rows", [])))
+                result = _merge_ocr_text(result, ocr_items, self._img_h)
+                return result
+        else:
+            # Default: compact format
+            logger.info("Step 1: Qwen VL → compact format")
+            raw = await self._call_vision(b64, fmt)
+            self._last_raw = raw
+            _save_debug(raw, "qwen_compact")
+
+            result = _parse_compact(raw)
+            if result is not None:
+                logger.info("Step 1 OK (Python): %d rows", len(result.get("rows", [])))
+                result = _merge_ocr_text(result, ocr_items, self._img_h)
+                return result
+
+        # Step 2: DeepSeek structures → JSON
         logger.info("Step 2: DeepSeek structuring")
         ocr_text = _ocr_to_text(ocr_items, self._img_h) if ocr_items else ""
-        context = f"紧凑格式数据：\n\n{raw}"
+        context = f"数据：\n\n{raw}"
         if ocr_text:
             context = f"{ocr_text}\n\n---\n{context}"
 
@@ -606,8 +830,10 @@ class LLMService:
     # API calls
     # ------------------------------------------------------------------
 
-    async def _call_vision(self, b64_img: str, fmt: str) -> str:
-        """Qwen VL: image → JSON text."""
+    async def _call_vision(self, b64_img: str, fmt: str, prompt: str = None) -> str:
+        """Qwen VL: image → structured text."""
+        if prompt is None:
+            prompt = VISION_PROMPT
         url = f"{self._vu}/chat/completions"
         async with httpx.AsyncClient(timeout=self._to) as cli:
             r = await cli.post(url, headers={
@@ -618,7 +844,7 @@ class LLMService:
                 "messages": [{"role": "user", "content": [
                     {"type": "image_url", "image_url": {
                         "url": f"data:image/{fmt.lower()};base64,{b64_img}"}},
-                    {"type": "text", "text": VISION_PROMPT},
+                    {"type": "text", "text": prompt},
                 ]}],
                 "max_tokens": max(self._mt, 8192),
                 "temperature": 0.1,

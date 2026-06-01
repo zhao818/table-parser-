@@ -48,6 +48,7 @@ class Settings(BaseSettings):
 
     # --- Pipeline Mode ---
     pipeline_mode: str = "dual"  # "dual" = Qwen VL + DeepSeek, "single" = one model
+    table_output_format: str = "compact"  # "compact" | "html" — Qwen VL output format
 
     # --- Stage 1: Vision (reads image → raw text) ---
     vision_api_key: str = ""
