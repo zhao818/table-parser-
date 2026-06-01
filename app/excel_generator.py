@@ -41,10 +41,11 @@ def generate_excel(
     auto_width: bool = True,
     first_row_as_header: bool = True,
     image_aspect_ratio: float = 0.0,  # w/h, 0 = auto-detect from data
+    column_widths: list[float] | None = None,  # OCR-derived width proportions (sum=1.0)
 ) -> io.BytesIO:
     wb = Workbook()
     ws = wb.active
-    _populate(ws, table_data, sheet_name, title, auto_width, first_row_as_header, image_aspect_ratio)
+    _populate(ws, table_data, sheet_name, title, auto_width, first_row_as_header, image_aspect_ratio, column_widths)
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -110,6 +111,7 @@ def _populate(
     ws, table_data: TableData, sheet_name: str,
     title: Optional[str], auto_width: bool, first_row_as_header: bool,
     image_aspect_ratio: float = 0.0,
+    column_widths: list[float] | None = None,
 ) -> None:
     ws.title = sheet_name[:31]
     display_title = title or table_data.title
@@ -194,16 +196,35 @@ def _populate(
 
     # Column widths
     if auto_width:
-        for col_idx in range(1, max_col + 1):
-            mw = _MIN_W
-            letter = get_column_letter(col_idx)
-            for ri in range(data_start, last_row + 1):
-                cell = ws.cell(row=ri, column=col_idx)
-                if cell.value:
-                    text = str(cell.value)
-                    w = sum(_CJK if ord(ch) > 0x2E80 else _LATIN for ch in text)
-                    mw = max(mw, min(w + 3, _MAX_W))
-            ws.column_dimensions[letter].width = mw
+        if column_widths and len(column_widths) == max_col:
+            # Use OCR-derived pixel proportions, scaled to Excel column units
+            total_base = max_col * 14  # base total width in character units
+            for col_idx in range(1, max_col + 1):
+                letter = get_column_letter(col_idx)
+                prop = column_widths[col_idx - 1]
+                # Proportional width, ensure minimum for readability
+                w = max(_MIN_W, min(total_base * prop, _MAX_W))
+                # Blend with text-driven width: take max of proportional vs text-minimum
+                text_w = _MIN_W
+                for ri in range(data_start, last_row + 1):
+                    cell = ws.cell(row=ri, column=col_idx)
+                    if cell.value:
+                        text = str(cell.value)
+                        tw = sum(_CJK if ord(ch) > 0x2E80 else _LATIN for ch in text)
+                        text_w = max(text_w, min(tw + 3, _MAX_W))
+                ws.column_dimensions[letter].width = max(w, text_w)
+        else:
+            # Fallback: purely text-driven widths
+            for col_idx in range(1, max_col + 1):
+                mw = _MIN_W
+                letter = get_column_letter(col_idx)
+                for ri in range(data_start, last_row + 1):
+                    cell = ws.cell(row=ri, column=col_idx)
+                    if cell.value:
+                        text = str(cell.value)
+                        w = sum(_CJK if ord(ch) > 0x2E80 else _LATIN for ch in text)
+                        mw = max(mw, min(w + 3, _MAX_W))
+                ws.column_dimensions[letter].width = mw
 
     # Row heights
     for ri in range(data_start, last_row + 1):

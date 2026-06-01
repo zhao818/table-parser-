@@ -198,6 +198,7 @@ def create_app() -> FastAPI:
             auto_width=auto_width,
             first_row_as_header=first_row_as_header,
             image_aspect_ratio=_ratio,
+            column_widths=svc.column_widths,
         )
 
         filename = _sanitize_filename(file.filename or "table") + ".xlsx"
