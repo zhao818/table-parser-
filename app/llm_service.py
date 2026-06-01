@@ -24,6 +24,7 @@ from PIL import Image
 
 from .config import get_settings
 from .models import CellData, TableData
+from .table_layout import normalize_layout
 
 logger = logging.getLogger(__name__)
 
@@ -531,52 +532,6 @@ def _merge_ocr_text(table: dict[str, Any], ocr_items: list[dict], img_h: int = 0
     return table
 
 
-def _compute_column_widths_from_ocr(table: dict[str, Any], ocr_items: list[dict]) -> list[float] | None:
-    """Compute column width proportions from OCR pixel positions.
-
-    Clusters OCR items by x-coordinate to find physical column widths,
-    then maps them to the logical grid columns from the table structure.
-    Returns list of width proportions (sum = 1.0), one per grid column.
-    """
-    rows = table.get("rows", [])
-    if not rows or not ocr_items:
-        return None
-
-    max_col = max(len(row) for row in rows)
-    if max_col <= 1:
-        return None
-
-    # Cluster all OCR x_centers into max_col groups
-    x_centers = sorted([it["x"] + it.get("w", 0) / 2 for it in ocr_items])
-    x_min, x_max = x_centers[0], x_centers[-1]
-    if x_max - x_min < 10:
-        return None
-
-    # Compute pixel width for each column cluster
-    bin_width = (x_max - x_min) / max_col
-    col_widths_px = []
-    for i in range(max_col):
-        lo = x_min + i * bin_width
-        hi = x_min + (i + 1) * bin_width
-        items_in_bin = [it for it in ocr_items
-                        if lo <= (it["x"] + it.get("w", 0) / 2) < hi]
-        if items_in_bin:
-            # Width: from leftmost item start to rightmost item end
-            left = min(it["x"] for it in items_in_bin)
-            right = max(it["x"] + it.get("w", 0) for it in items_in_bin)
-            col_widths_px.append(max(right - left, 1))
-        else:
-            col_widths_px.append(bin_width)
-
-    # Normalize to proportions
-    total = sum(col_widths_px)
-    proportions = [w / total for w in col_widths_px]
-
-    logger.info("Column widths from OCR: %s",
-                ", ".join(f"{p:.1%}" for p in proportions))
-    return proportions
-
-
 def _detect_columns_from_ocr(items: list[dict]) -> list[tuple[float, float]]:
     """Detect column boundaries from OCR item x-positions using gap analysis.
 
@@ -800,7 +755,8 @@ class LLMService:
             raw = _build_from_ocr(ocr_items, img_h)
             if raw is None:
                 raise RuntimeError("All strategies failed. Try a clearer image.")
-            self.column_widths = _compute_column_widths_from_ocr(raw, ocr_items)
+            raw = normalize_layout(raw, ocr_items)
+            self.column_widths = raw.get("column_widths")
 
         if self._cache:
             self._cache.set(ck, raw.copy())
@@ -832,7 +788,8 @@ class LLMService:
             if result is not None:
                 logger.info("Step 1 OK (HTML): %d rows", len(result.get("rows", [])))
                 result = _merge_ocr_text(result, ocr_items, self._img_h)
-                self.column_widths = _compute_column_widths_from_ocr(result, ocr_items)
+                result = normalize_layout(result, ocr_items)
+                self.column_widths = result.get("column_widths")
                 return result
 
             # HTML failed — try parsing as compact format (same raw text, no extra API call)
@@ -841,7 +798,8 @@ class LLMService:
             if result is not None:
                 logger.info("Step 1 OK (compact fallback): %d rows", len(result.get("rows", [])))
                 result = _merge_ocr_text(result, ocr_items, self._img_h)
-                self.column_widths = _compute_column_widths_from_ocr(result, ocr_items)
+                result = normalize_layout(result, ocr_items)
+                self.column_widths = result.get("column_widths")
                 return result
         else:
             # Default: compact format
@@ -854,7 +812,8 @@ class LLMService:
             if result is not None:
                 logger.info("Step 1 OK (Python): %d rows", len(result.get("rows", [])))
                 result = _merge_ocr_text(result, ocr_items, self._img_h)
-                self.column_widths = _compute_column_widths_from_ocr(result, ocr_items)
+                result = normalize_layout(result, ocr_items)
+                self.column_widths = result.get("column_widths")
                 return result
 
         # Step 2: DeepSeek structures → JSON
@@ -867,14 +826,16 @@ class LLMService:
         result = await self._call_structuring(context)
         if result is not None:
             result = _merge_ocr_text(result, ocr_items, self._img_h)
-            self.column_widths = _compute_column_widths_from_ocr(result, ocr_items)
+            result = normalize_layout(result, ocr_items)
+            self.column_widths = result.get("column_widths")
             return result
 
         # Step 3: OCR fallback
         logger.warning("Step 3: OCR fallback")
         result = _build_from_ocr(ocr_items, self._img_h)
         if result is not None:
-            self.column_widths = _compute_column_widths_from_ocr(result, ocr_items)
+            result = normalize_layout(result, ocr_items)
+            self.column_widths = result.get("column_widths")
             return result
 
         raise RuntimeError("All strategies exhausted")
